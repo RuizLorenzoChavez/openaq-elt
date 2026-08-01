@@ -51,7 +51,6 @@ def extract_countries():
     for retry in range(1, MAX_RETRIES):
             
         try:
-            logger.debug(f"CHECKPOINT: Extraction trial {retry} of {MAX_RETRIES - 1} ")
             
             #   requesting country-level data from OpenAQ API
             response = requests.get(url=COUNTRIES_URL,
@@ -68,21 +67,16 @@ def extract_countries():
             limit = int(response.headers.get('X-ratelimit-limit', 0))
             reset = int(response.headers.get('X-ratelimit-reset', 0))
             
-            logger.debug(f"CHECKPOINT: Requesting country data ({used}/{limit} resets in {reset})")
-            
             #   converting request output to JSON
             response_json = response.json()
 
             #   checking queried results amount
             response_num = response_json.get('meta', {}).get('found')
-            logger.info(f"CHECKPOINT: Total number of countries retrieved: {response_num}")
 
             #   extracting country-level query results 
             results = response_json.get('results', [])
 
             for result in results:
-                
-                logger.debug(f"PROCESS: Extracting {result.get('name', None)}")
                 
                 country = {}
                 
@@ -94,22 +88,9 @@ def extract_countries():
             
             break
         
-        except requests.exceptions.HTTPError as http_err:
-            logger.warning(f"PROCESS HALTED: HTTP error occurred: {http_err}")
-            time.sleep(2 ** retry)
-            
-        except requests.exceptions.ConnectionError as conn_err:
-            logger.warning(f"PROCESS HALTED: Connection error occurred: {conn_err}")
-            time.sleep(2 ** retry)
-            
-        except requests.exceptions.Timeout as timeout_err:
-            logger.warning(f"PROCESS HALTED: Timeout error occurred: {timeout_err}")
-            time.sleep(2 ** retry)
-            
-        except requests.exceptions.RequestException as err:
-            logger.warning(f"PROCESS HALTED An error occurred: {err}")
-            time.sleep(2 ** retry)
-            
+        except (requests.exceptions.RequestException, json.decoder.JSONDecodeError) as err:
+                logger.warning(f"PROCESS HALTED on country #{country_id} (Attempt {retry}): {err}")
+                time.sleep(2 ** retry)
                   
 def main():
     logger.info(f"PROCESS STARTED: Country-level data extraction initiated.")
@@ -139,7 +120,6 @@ def main():
             country_id = country.get("id", 0)
             
             if country_id not in reference:
-                logger.debug(f"PROCESS: Writing {country.get('name', None)} into {COUNTRY_PATH}")
                 json.dump(country, file)
                 file.write("\n")
             
