@@ -43,128 +43,75 @@ logger.addHandler(file_handler)
 
 # ========== ASYNC WORKERS ==========
 
-async def fetch_page(session, country_id, country_name, page, semaphore, queue):
-    """Fetches a single page of locations for a given country."""
-    logger.debug(f"Attempting to acquire semaphore for {country_name} (Page {page})...")
-    async with semaphore:
-        logger.debug(f"Semaphore acquired for {country_name} (Page {page}).")
+async def process_country(session, country_id, country_name, semaphore, queue):
+    """Fetches all pages for a given country sequentially until results are exhausted."""
+    logger.debug(f"Starting process_country task for {country_name} (ID: {country_id}).")
+    page = 1
+    
+    while True:
+        success = False
+        response_json = {}
         
+        # Retry loop for this specific page
         for retry in range(1, MAX_RETRIES + 1):
+            rate_limit_wait = 0
             try:
-                logger.debug(f"PROCESS: Country #{country_id} Page {page} trial {retry} of {MAX_RETRIES}")
-                
-                # Respect rate limit manually if needed
-                logger.debug(f"Applying rate limit delay of {RATE_LIMIT_DELAY}s...")
-                await asyncio.sleep(RATE_LIMIT_DELAY) 
+                # 1. Acquire semaphore just for the request
+                async with semaphore:
+                    await asyncio.sleep(RATE_LIMIT_DELAY) 
 
-                headers = {"X-API-Key": API_KEY} if API_KEY else {}
-                params = {
-                    "order_by": "id",
-                    "countries_id": country_id,
-                    "limit": MAX_LIMIT,
-                    "page": page
-                }
-
-                logger.debug(f"Sending GET request to {LOCATIONS_URL} for {country_name} (Page {page})...")
-                async with session.get(LOCATIONS_URL, params=params, headers=headers, timeout=15) as response:
-                    logger.debug(f"Received response for {country_name} (Page {page}) with status {response.status}.")
-                    
-                    # Check Rate Limits Headers
-                    used = int(response.headers.get('X-ratelimit-used', 0))
-                    reset = int(response.headers.get('X-ratelimit-reset', 0))
-                    logger.debug(f"Rate limit stats - Used: {used}, Reset in: {reset}s.")
-                    
-                    if response.status == 429 or used >= 55:
-                        wait_time = reset if reset > 0 else 60
-                        logger.warning(f"Rate limit hit or nearing limit (used: {used}). Waiting {wait_time}s.")
-                        await asyncio.sleep(wait_time)
-                        continue # Retry after waiting
-
-                    response.raise_for_status()
-                    logger.debug(f"Parsing JSON response for {country_name} (Page {page})...")
-                    response_json = await response.json()
-
-                    # Put data in queue to be written
-                    logger.debug(f"Putting data for {country_name} (Page {page}) into the writer queue...")
-                    await queue.put({
-                        "country_name": country_name,
-                        "data": response_json,
+                    headers = {"X-API-Key": API_KEY} if API_KEY else {}
+                    params = {
+                        "order_by": "id",
+                        "countries_id": country_id,
+                        "limit": MAX_LIMIT,
                         "page": page
-                    })
-                    logger.debug(f"Successfully queued data for {country_name} (Page {page}).")
-                    return # Success
+                    }
+
+                    logger.debug(f"Fetching {country_name} Page {page}...")
+                    async with session.get(LOCATIONS_URL, params=params, headers=headers, timeout=15) as response:
+                        used = int(response.headers.get('X-ratelimit-used', 0))
+                        reset = int(response.headers.get('X-ratelimit-reset', 0))
+                        
+                        # Check rate limits BEFORE parsing
+                        if response.status == 429 or used >= 55:
+                            rate_limit_wait = reset if reset > 0 else 60
+                        else:
+                            response.raise_for_status()
+                            response_json = await response.json()
+                            success = True
+                            break # Success, break out of retry loop
+                
+                # 2. Release semaphore BEFORE sleeping if rate limited
+                if rate_limit_wait > 0:
+                    logger.warning(f"Rate limit hit/near for {country_name} Page {page}. Waiting {rate_limit_wait}s.")
+                    await asyncio.sleep(rate_limit_wait)
+                    continue
 
             except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as err:
                 logger.warning(f"PROCESS HALTED on country #{country_id} Page {page} (Attempt {retry}): {err}")
                 await asyncio.sleep(2 ** retry)
 
-        logger.error(f"Failed to extract page #{page} for country #{country_id} after {MAX_RETRIES} retries.")
+        if not success:
+            logger.error(f"Failed to extract page #{page} for country {country_name} after {MAX_RETRIES} retries. Aborting country.")
+            break
 
-async def process_country(session, country_id, country_name, semaphore, queue):
-    """Determines how many pages a country has and schedules their extraction."""
-    logger.debug(f"Starting process_country task for {country_name} (ID: {country_id}).")
-    page = 1
-    
-    logger.debug(f"Attempting to acquire semaphore for {country_name} initial metadata request...")
-    async with semaphore:
-        logger.debug(f"Semaphore acquired for {country_name} initial request.")
-        logger.debug(f"Applying rate limit delay of {RATE_LIMIT_DELAY}s...")
-        await asyncio.sleep(RATE_LIMIT_DELAY)
+        results = response_json.get('results', [])
         
-        headers = {"X-API-Key": API_KEY} if API_KEY else {}
-        params = {
-            "order_by": "id",
-            "countries_id": country_id,
-            "limit": MAX_LIMIT,
-            "page": page
-        }
-        
-        try:
-            logger.debug(f"Sending GET request for initial metadata: {country_name}...")
-            async with session.get(LOCATIONS_URL, params=params, headers=headers, timeout=15) as response:
-                 
-                used = int(response.headers.get('X-ratelimit-used', 0))
-                reset = int(response.headers.get('X-ratelimit-reset', 0))
-                
-                if response.status == 429 or used >= 55:
-                    wait_time = reset if reset > 0 else 60
-                    logger.warning(f"Rate limit hit on initial request. Waiting {wait_time}s.")
-                    await asyncio.sleep(wait_time)
-                    return 
-                    
-                response.raise_for_status()
-                response_json = await response.json()
-                
-                found = response_json.get('meta', {}).get('found', 0)
-                if not isinstance(found, int):
-                    found = 0
-                
-                logger.debug(f"Metadata received for {country_name}: {found} total locations found.")
-                
-                # Queue the first page's data immediately since we already fetched it
-                logger.debug(f"Putting initial page data for {country_name} into queue...")
-                await queue.put({
-                    "country_name": country_name,
-                    "data": response_json,
-                    "page": page
-                })
+        # Only queue if we actually have data
+        if results:
+            await queue.put({
+                "country_name": country_name,
+                "data": response_json,
+                "page": page
+            })
 
-                # Calculate remaining pages and schedule tasks for them
-                total_pages = (found // MAX_LIMIT) + (1 if found % MAX_LIMIT > 0 else 0)
-                logger.debug(f"Calculated {total_pages} total pages for {country_name}.")
-                
-                tasks = []
-                for p in range(2, total_pages + 1):
-                    logger.debug(f"Scheduling task for {country_name} (Page {p})...")
-                    tasks.append(fetch_page(session, country_id, country_name, p, semaphore, queue))
-                
-                if tasks:
-                    logger.debug(f"Awaiting {len(tasks)} sub-tasks for {country_name}...")
-                    await asyncio.gather(*tasks)
-                    logger.debug(f"All sub-tasks for {country_name} completed.")
-                    
-        except Exception as e:
-            logger.error(f"Failed to fetch initial data for country {country_name}: {e}")
+        # If the API returned fewer items than our limit, we have reached the last page
+        if len(results) < MAX_LIMIT:
+            logger.debug(f"Reached final page for {country_name}. Total pages extracted: {page}")
+            break
+            
+        page += 1
 
 async def writer_worker(queue, loc_ids_list):
     """Reads from the queue and writes data to disk."""
@@ -181,19 +128,17 @@ async def writer_worker(queue, loc_ids_list):
             
         country_name = item['country_name']
         page_num = item.get('page', 'Unknown')
-        logger.debug(f"Writer worker pulled data for {country_name} (Page {page_num}) from queue.")
         
         data = item['data']
         results = data.get('results', [])
         temp_file_path = LOCATION_PATH / f"{country_name}.jsonl.tmp"
         
         if country_name not in files:
-            logger.debug(f"Opening temporary file for appending: {temp_file_path}")
             files[country_name] = open(temp_file_path, "a", encoding="utf-8")
             
         file = files[country_name]
 
-        logger.debug(f"Writing {len(results)} records for {country_name}...")
+        logger.debug(f"Writing {len(results)} records for {country_name} (Page {page_num})...")
         for result in results:
             country = result.get("country", {})
             coords = result.get("coordinates", {})
@@ -213,17 +158,15 @@ async def writer_worker(queue, loc_ids_list):
             loc_ids_list.append({"loc_id": location.get("loc_id")})
             write_count += 1
             
-        logger.debug(f"Finished writing {len(results)} records for {country_name} (Page {page_num}).")
         queue.task_done()
 
     logger.debug("Writer worker loop exited. Proceeding to finalize files.")
     for name, file in files.items():
-        logger.debug(f"Closing file for {name}...")
         file.close()
         temp_path = LOCATION_PATH / f"{name}.jsonl.tmp"
         final_path = LOCATION_PATH / f"{name}.jsonl"
-        logger.debug(f"Renaming {temp_path} -> {final_path}")
-        temp_path.replace(final_path)
+        if temp_path.exists():
+            temp_path.replace(final_path)
 
     logger.debug(f"Writer worker completely finished. Total records written: {write_count}.")
     return write_count
@@ -232,14 +175,11 @@ async def run_extraction():
     logger.info(f"PROCESS STARTED: Async location data extraction initiated.")
     START_TIME = time.perf_counter()
 
-    logger.debug(f"Checking if LOCATION_PATH ({LOCATION_PATH}) exists...")
     if not LOCATION_PATH.exists():
-        logger.debug(f"LOCATION_PATH missing. Creating directories...")
         LOCATION_PATH.mkdir(parents=True)
 
     # Collect country IDs
     country_keys = set()
-    logger.debug(f"Reading country keys from {COUNTRY_PATH}...")
     try:
         with open(COUNTRY_PATH, "r") as keys:
             for key in keys:
@@ -255,59 +195,47 @@ async def run_extraction():
     queue = asyncio.Queue()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
-    logger.debug("Starting writer_worker task...")
     writer_task = asyncio.create_task(writer_worker(queue, LOC_IDS))
 
-    logger.debug("Initializing aiohttp ClientSession...")
     async with aiohttp.ClientSession() as session:
         tasks = []
         for country_id, country_name in country_keys:
             if not country_id or not country_name:
-                logger.debug(f"Skipping invalid country entry: ID {country_id}, Name {country_name}")
                 continue
             
             # Ensure any old tmp files are removed before starting
             tmp_file = LOCATION_PATH / f"{country_name}.jsonl.tmp"
             if tmp_file.exists():
-                logger.debug(f"Found orphaned tmp file {tmp_file}. Removing...")
                 tmp_file.unlink()
                 
             tasks.append(process_country(session, country_id, country_name, semaphore, queue))
         
-        logger.debug(f"Awaiting all {len(tasks)} primary country processing tasks...")
+        # This safely executes up to MAX_CONCURRENT_REQUESTS HTTP calls at a time
         await asyncio.gather(*tasks)
-        logger.debug("All primary country processing tasks finished.")
 
-    logger.debug("Waiting for the queue to be fully processed (queue.join())...")
+    # Wait for the queue to flush
     await queue.join()
-    logger.debug("Queue is empty and fully processed.")
     
-    logger.debug("Sending poison pill to writer worker...")
+    # Send poison pill to the worker to close out the files
     await queue.put(None)
     write_count = await writer_task
-    logger.debug("Writer worker returned successfully.")
 
-    logger.debug(f"Writing reference file to {LOCATION_REF_PATH}...")
     with open(LOCATION_REF_PATH, "w", encoding="utf-8") as ref:
         for loc_id in LOC_IDS:
             json.dump(loc_id, ref)
             ref.write("\n")
-    logger.debug("Reference file created successfully.")
 
     END_TIME = time.perf_counter()
     ELAPSED_TIME = (END_TIME - START_TIME) / 60 
     
-    logger.debug("Calculating total volume on disk...")
     try:
         TOTAL_BYTES = sum(f.stat().st_size for f in LOCATION_PATH.glob("*.jsonl")) / (1024 ** 3)
     except Exception as e:
-        logger.debug(f"Error calculating disk volume: {e}")
         TOTAL_BYTES = 0
 
     logger.info(f"PROCESS SUMMARY: Extraction took {ELAPSED_TIME:.4f} minutes")
     logger.info(f"PROCESS SUMMARY: Total volume on disk: {TOTAL_BYTES:.4f} GB")
     logger.info(f"PROCESS TERMINATED: {write_count} locations written")
 
-# ========== MAIN ==========
 if __name__ == "__main__":
     asyncio.run(run_extraction())
